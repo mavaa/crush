@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,9 @@ func init() {
 	rootCmd.PersistentFlags().BoolP("debug", "d", false, "Debug")
 	rootCmd.Flags().BoolP("help", "h", false, "Help")
 	rootCmd.Flags().BoolP("yolo", "y", false, "Automatically accept all permissions (dangerous mode)")
+	rootCmd.Flags().StringP("session", "s", "", "Continue a previous session by ID")
+	rootCmd.Flags().BoolP("continue", "C", false, "Continue the most recent session")
+	rootCmd.MarkFlagsMutuallyExclusive("session", "continue")
 
 	rootCmd.AddCommand(
 		runCmd,
@@ -73,13 +77,31 @@ crush --yolo
 
 # Run with custom data directory
 crush --data-dir /path/to/custom/.crush
+
+# Continue a previous session
+crush --session {session-id}
+
+# Continue the most recent session
+crush --continue
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		sessionID, _ := cmd.Flags().GetString("session")
+		continueLast, _ := cmd.Flags().GetBool("continue")
+
 		app, err := setupAppWithProgressBar(cmd)
 		if err != nil {
 			return err
 		}
 		defer app.Shutdown()
+
+		// Resolve session ID if provided
+		if sessionID != "" {
+			sess, err := resolveSessionID(cmd.Context(), app.Sessions, sessionID)
+			if err != nil {
+				return err
+			}
+			sessionID = sess.ID
+		}
 
 		event.AppInitialized()
 
@@ -87,7 +109,7 @@ crush --data-dir /path/to/custom/.crush
 		var env uv.Environ = os.Environ()
 
 		com := common.DefaultCommon(app)
-		model := ui.New(com)
+		model := ui.New(com, sessionID, continueLast)
 
 		program := tea.NewProgram(
 			model,
@@ -284,11 +306,20 @@ func createDotCrushDir(dir string) error {
 	}
 
 	gitIgnorePath := filepath.Join(dir, ".gitignore")
-	if _, err := os.Stat(gitIgnorePath); os.IsNotExist(err) {
-		if err := os.WriteFile(gitIgnorePath, []byte("*\n"), 0o644); err != nil {
+	content, err := os.ReadFile(gitIgnorePath)
+
+	// create or update if old version
+	if os.IsNotExist(err) || string(content) == oldGitIgnore {
+		if err := os.WriteFile(gitIgnorePath, []byte(defaultGitIgnore), 0o644); err != nil {
 			return fmt.Errorf("failed to create .gitignore file: %q %w", gitIgnorePath, err)
 		}
 	}
 
 	return nil
 }
+
+//go:embed gitignore/old
+var oldGitIgnore string
+
+//go:embed gitignore/default
+var defaultGitIgnore string

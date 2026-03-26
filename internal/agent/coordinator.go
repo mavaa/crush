@@ -41,7 +41,7 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 	"charm.land/fantasy/providers/openrouter"
 	"charm.land/fantasy/providers/vercel"
-	openaisdk "github.com/openai/openai-go/v3/option"
+	openaisdk "github.com/charmbracelet/openai-go/option"
 	"github.com/qjebbs/go-jsons"
 )
 
@@ -778,9 +778,8 @@ func (c *coordinator) buildGoogleVertexProvider(headers map[string]string, optio
 	return google.New(opts...)
 }
 
-func (c *coordinator) buildHyperProvider(baseURL, apiKey string) (fantasy.Provider, error) {
+func (c *coordinator) buildHyperProvider(apiKey string) (fantasy.Provider, error) {
 	opts := []hyper.Option{
-		hyper.WithBaseURL(baseURL),
 		hyper.WithAPIKey(apiKey),
 	}
 	if c.cfg.Config().Options.Debug {
@@ -842,7 +841,7 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 		}
 		return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID, isSubAgent)
 	case hyper.Name:
-		return c.buildHyperProvider(baseURL, apiKey)
+		return c.buildHyperProvider(apiKey)
 	default:
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)
 	}

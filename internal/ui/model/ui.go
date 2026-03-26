@@ -66,8 +66,11 @@ const (
 	compactModeHeightBreakpoint = 30
 )
 
-// If pasted text has more than 2 newlines, treat it as a file attachment.
+// If pasted text has more than 10 newlines, treat it as a file attachment.
 const pasteLinesThreshold = 10
+
+// If pasted text has more than 1000 columns, treat it as a file attachment.
+const pasteColsThreshold = 1000
 
 // Session details panel max height.
 const sessionDetailsMaxHeight = 20
@@ -138,6 +141,11 @@ type UI struct {
 
 	// keeps track of read files while we don't have a session id
 	sessionFileReads []string
+
+	// initialSessionID is set when loading a specific session on startup.
+	initialSessionID string
+	// continueLastSession is set to continue the most recent session on startup.
+	continueLastSession bool
 
 	lastUserMessageTime int64
 
@@ -246,7 +254,7 @@ type UI struct {
 }
 
 // New creates a new instance of the [UI] model.
-func New(com *common.Common) *UI {
+func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 	// Editor components
 	ta := textarea.New()
 	ta.SetStyles(com.Styles.TextArea)
@@ -302,6 +310,8 @@ func New(com *common.Common) *UI {
 		mcpStates:           make(map[string]mcp.ClientInfo),
 		notifyBackend:       notification.NoopBackend{},
 		notifyWindowFocused: true,
+		initialSessionID:    initialSessionID,
+		continueLastSession: continueLast,
 	}
 
 	status := NewStatus(com, ui)
@@ -350,7 +360,32 @@ func (m *UI) Init() tea.Cmd {
 	cmds = append(cmds, m.loadCustomCommands())
 	// load prompt history async
 	cmds = append(cmds, m.loadPromptHistory())
+	// load initial session if specified
+	if cmd := m.loadInitialSession(); cmd != nil {
+		cmds = append(cmds, cmd)
+	}
 	return tea.Batch(cmds...)
+}
+
+// loadInitialSession loads the initial session if one was specified on startup.
+func (m *UI) loadInitialSession() tea.Cmd {
+	switch {
+	case m.state != uiLanding:
+		// Only load if we're in landing state (i.e., fully configured)
+		return nil
+	case m.initialSessionID != "":
+		return m.loadSession(m.initialSessionID)
+	case m.continueLastSession:
+		return func() tea.Msg {
+			sess, err := m.com.App.Sessions.GetLast(context.Background())
+			if err != nil {
+				return nil
+			}
+			return m.loadSession(sess.ID)()
+		}
+	default:
+		return nil
+	}
 }
 
 // sendNotification returns a command that sends a notification if allowed by policy.
@@ -1357,6 +1392,12 @@ func (m *UI) handleDialogMsg(msg tea.Msg) tea.Cmd {
 		m.dialog.CloseDialog(dialog.CommandsID)
 	case dialog.ActionQuit:
 		cmds = append(cmds, tea.Quit)
+	case dialog.ActionEnableDockerMCP:
+		m.dialog.CloseDialog(dialog.CommandsID)
+		cmds = append(cmds, m.enableDockerMCP)
+	case dialog.ActionDisableDockerMCP:
+		m.dialog.CloseDialog(dialog.CommandsID)
+		cmds = append(cmds, m.disableDockerMCP)
 	case dialog.ActionInitializeProject:
 		if m.isAgentBusy() {
 			cmds = append(cmds, util.ReportWarn("Agent is busy, please wait before summarizing session..."))
@@ -2328,11 +2369,6 @@ func (m *UI) FullHelp() [][]key.Binding {
 					},
 				)
 			}
-			binds = append(binds,
-				[]key.Binding{
-					help,
-				},
-			)
 		}
 	}
 
@@ -2979,6 +3015,10 @@ func (m *UI) openDialog(id string) tea.Cmd {
 		if cmd := m.openReasoningDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+	case dialog.FilePickerID:
+		if cmd := m.openFilesDialog(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case dialog.QuitID:
 		if cmd := m.openQuitDialog(); cmd != nil {
 			cmds = append(cmds, cmd)
@@ -3045,7 +3085,7 @@ func (m *UI) openCommandsDialog() tea.Cmd {
 
 	m.dialog.OpenDialog(commands)
 
-	return nil
+	return commands.InitialCmd()
 }
 
 // openReasoningDialog opens the reasoning effort dialog.
@@ -3188,7 +3228,7 @@ func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
 		return nil
 	}
 
-	if strings.Count(msg.Content, "\n") > pasteLinesThreshold {
+	if hasPasteExceededThreshold(msg) {
 		return func() tea.Msg {
 			content := []byte(msg.Content)
 			if int64(len(content)) > common.MaxAttachmentSize {
@@ -3244,6 +3284,22 @@ func (m *UI) handlePasteMsg(msg tea.PasteMsg) tea.Cmd {
 		cmds = append(cmds, m.handleFilePathPaste(path))
 	}
 	return tea.Batch(cmds...)
+}
+
+func hasPasteExceededThreshold(msg tea.PasteMsg) bool {
+	var (
+		lineCount = 0
+		colCount  = 0
+	)
+	for line := range strings.SplitSeq(msg.Content, "\n") {
+		lineCount++
+		colCount = max(colCount, len(line))
+
+		if lineCount > pasteLinesThreshold || colCount > pasteColsThreshold {
+			return true
+		}
+	}
+	return false
 }
 
 // handleFilePathPaste handles a pasted file path.
@@ -3489,6 +3545,47 @@ func (m *UI) copyChatHighlight() tea.Cmd {
 			return nil
 		},
 	)
+}
+
+func (m *UI) enableDockerMCP() tea.Msg {
+	store := m.com.Store()
+	// Stage Docker MCP in memory first so startup and persistence can be atomic.
+	mcpConfig, err := store.PrepareDockerMCPConfig()
+	if err != nil {
+		return util.ReportError(err)()
+	}
+
+	ctx := context.Background()
+	if err := mcp.InitializeSingle(ctx, config.DockerMCPName, store); err != nil {
+		// Roll back runtime and in-memory state when startup fails.
+		disableErr := mcp.DisableSingle(store, config.DockerMCPName)
+		delete(store.Config().MCP, config.DockerMCPName)
+		return util.ReportError(fmt.Errorf("failed to start docker MCP: %w", errors.Join(err, disableErr)))()
+	}
+
+	if err := store.PersistDockerMCPConfig(mcpConfig); err != nil {
+		// Roll back runtime and in-memory state if persistence fails.
+		disableErr := mcp.DisableSingle(store, config.DockerMCPName)
+		delete(store.Config().MCP, config.DockerMCPName)
+		return util.ReportError(fmt.Errorf("docker MCP started but failed to persist configuration: %w", errors.Join(err, disableErr)))()
+	}
+
+	return util.NewInfoMsg("Docker MCP enabled and started successfully")
+}
+
+func (m *UI) disableDockerMCP() tea.Msg {
+	store := m.com.Store()
+	// Close the Docker MCP client.
+	if err := mcp.DisableSingle(store, config.DockerMCPName); err != nil {
+		return util.ReportError(fmt.Errorf("failed to disable docker MCP: %w", err))()
+	}
+
+	// Remove from config and persist.
+	if err := store.DisableDockerMCP(); err != nil {
+		return util.ReportError(err)()
+	}
+
+	return util.NewInfoMsg("Docker MCP disabled successfully")
 }
 
 // renderLogo renders the Crush logo with the given styles and dimensions.
