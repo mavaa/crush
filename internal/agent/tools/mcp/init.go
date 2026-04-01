@@ -38,8 +38,22 @@ func parseLevel(level mcp.LoggingLevel) slog.Level {
 	}
 }
 
+// ClientSession wraps an mcp.ClientSession with a context cancel function so
+// that the context created during session establishment is properly cleaned up
+// on close.
+type ClientSession struct {
+	*mcp.ClientSession
+	cancel context.CancelFunc
+}
+
+// Close cancels the session context and then closes the underlying session.
+func (s *ClientSession) Close() error {
+	s.cancel()
+	return s.ClientSession.Close()
+}
+
 var (
-	sessions = csync.NewMap[string, *mcp.ClientSession]()
+	sessions = csync.NewMap[string, *ClientSession]()
 	states   = csync.NewMap[string, ClientInfo]()
 	broker   = pubsub.NewBroker[Event]()
 	initOnce sync.Once
@@ -102,7 +116,7 @@ type ClientInfo struct {
 	Name        string
 	State       State
 	Error       error
-	Client      *mcp.ClientSession
+	Client      *ClientSession
 	Counts      Counts
 	ConnectedAt time.Time
 }
@@ -123,37 +137,37 @@ func GetState(name string) (ClientInfo, bool) {
 }
 
 // Close closes all MCP clients. This should be called during application shutdown.
-func Close() error {
+func Close(ctx context.Context) error {
 	var wg sync.WaitGroup
-	done := make(chan struct{}, 1)
-	go func() {
-		for name, session := range sessions.Seq2() {
-			wg.Go(func() {
-				if err := session.Close(); err != nil &&
+	for name, session := range sessions.Seq2() {
+		wg.Go(func() {
+			done := make(chan error, 1)
+			go func() {
+				done <- session.Close()
+			}()
+			select {
+			case err := <-done:
+				if err != nil &&
 					!errors.Is(err, io.EOF) &&
 					!errors.Is(err, context.Canceled) &&
 					err.Error() != "signal: killed" {
 					slog.Warn("Failed to shutdown MCP client", "name", name, "error", err)
 				}
-			})
-		}
-		wg.Wait()
-		done <- struct{}{}
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
+			case <-ctx.Done():
+			}
+		})
 	}
+	wg.Wait()
 	broker.Shutdown()
 	return nil
 }
 
 // Initialize initializes MCP clients based on the provided configuration.
-func Initialize(ctx context.Context, permissions permission.Service, cfg *config.Config) {
+func Initialize(ctx context.Context, permissions permission.Service, cfg *config.ConfigStore) {
 	slog.Info("Initializing MCP clients")
 	var wg sync.WaitGroup
 	// Initialize states for all configured MCPs
-	for name, m := range cfg.MCP {
+	for name, m := range cfg.Config().MCP {
 		if m.Disabled {
 			updateState(name, StateDisabled, nil, nil, Counts{})
 			slog.Debug("Skipping disabled MCP", "name", name)
@@ -161,8 +175,6 @@ func Initialize(ctx context.Context, permissions permission.Service, cfg *config
 		}
 
 		// Set initial starting state
-		updateState(name, StateStarting, nil, nil, Counts{})
-
 		wg.Add(1)
 		go func(name string, m config.MCPConfig) {
 			defer func() {
@@ -182,46 +194,9 @@ func Initialize(ctx context.Context, permissions permission.Service, cfg *config
 				}
 			}()
 
-			// createSession handles its own timeout internally.
-			session, err := createSession(ctx, name, m, cfg.Resolver())
-			if err != nil {
-				return
+			if err := initClient(ctx, cfg, name, m, cfg.Resolver()); err != nil {
+				slog.Debug("failed to initialize mcp client", "name", name, "error", err)
 			}
-
-			tools, err := getTools(ctx, session)
-			if err != nil {
-				slog.Error("Error listing tools", "error", err)
-				updateState(name, StateError, err, nil, Counts{})
-				session.Close()
-				return
-			}
-
-			prompts, err := getPrompts(ctx, session)
-			if err != nil {
-				slog.Error("Error listing prompts", "error", err)
-				updateState(name, StateError, err, nil, Counts{})
-				session.Close()
-				return
-			}
-
-			resources, err := getResources(ctx, session)
-			if err != nil {
-				slog.Error("Error listing resources", "error", err)
-				updateState(name, StateError, err, nil, Counts{})
-				session.Close()
-				return
-			}
-
-			toolCount := updateTools(cfg, name, tools)
-			updatePrompts(name, prompts)
-			resourceCount := updateResources(name, resources)
-			sessions.Set(name, session)
-
-			updateState(name, StateConnected, nil, session, Counts{
-				Tools:     toolCount,
-				Prompts:   len(prompts),
-				Resources: resourceCount,
-			})
 		}(name, m)
 	}
 	wg.Wait()
@@ -239,13 +214,92 @@ func WaitForInit(ctx context.Context) error {
 	}
 }
 
-func getOrRenewClient(ctx context.Context, cfg *config.Config, name string) (*mcp.ClientSession, error) {
+// InitializeSingle initializes a single MCP client by name.
+func InitializeSingle(ctx context.Context, name string, cfg *config.ConfigStore) error {
+	m, exists := cfg.Config().MCP[name]
+	if !exists {
+		return fmt.Errorf("mcp '%s' not found in configuration", name)
+	}
+
+	if m.Disabled {
+		updateState(name, StateDisabled, nil, nil, Counts{})
+		slog.Debug("skipping disabled mcp", "name", name)
+		return nil
+	}
+
+	return initClient(ctx, cfg, name, m, cfg.Resolver())
+}
+
+// initClient initializes a single MCP client with the given configuration.
+func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m config.MCPConfig, resolver config.VariableResolver) error {
+	// Set initial starting state.
+	updateState(name, StateStarting, nil, nil, Counts{})
+
+	// createSession handles its own timeout internally.
+	session, err := createSession(ctx, name, m, resolver)
+	if err != nil {
+		return err
+	}
+
+	tools, err := getTools(ctx, session)
+	if err != nil {
+		slog.Error("Error listing tools", "error", err)
+		updateState(name, StateError, err, nil, Counts{})
+		session.Close()
+		return err
+	}
+
+	prompts, err := getPrompts(ctx, session)
+	if err != nil {
+		slog.Error("Error listing prompts", "error", err)
+		updateState(name, StateError, err, nil, Counts{})
+		session.Close()
+		return err
+	}
+
+	toolCount := updateTools(cfg, name, tools)
+	updatePrompts(name, prompts)
+	sessions.Set(name, session)
+
+	updateState(name, StateConnected, nil, session, Counts{
+		Tools:   toolCount,
+		Prompts: len(prompts),
+	})
+
+	return nil
+}
+
+// DisableSingle disables and closes a single MCP client by name.
+func DisableSingle(cfg *config.ConfigStore, name string) error {
+	session, ok := sessions.Get(name)
+	if ok {
+		if err := session.Close(); err != nil &&
+			!errors.Is(err, io.EOF) &&
+			!errors.Is(err, context.Canceled) &&
+			err.Error() != "signal: killed" {
+			slog.Warn("error closing mcp session", "name", name, "error", err)
+		}
+		sessions.Del(name)
+	}
+
+	// Clear tools and prompts for this MCP.
+	updateTools(cfg, name, nil)
+	updatePrompts(name, nil)
+
+	// Update state to disabled.
+	updateState(name, StateDisabled, nil, nil, Counts{})
+
+	slog.Info("Disabled mcp client", "name", name)
+	return nil
+}
+
+func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string) (*ClientSession, error) {
 	sess, ok := sessions.Get(name)
 	if !ok {
 		return nil, fmt.Errorf("mcp '%s' not available", name)
 	}
 
-	m := cfg.MCP[name]
+	m := cfg.Config().MCP[name]
 	state, _ := states.Get(name)
 
 	timeout := mcpTimeout(m)
@@ -268,7 +322,7 @@ func getOrRenewClient(ctx context.Context, cfg *config.Config, name string) (*mc
 }
 
 // updateState updates the state of an MCP client and publishes an event
-func updateState(name string, state State, err error, client *mcp.ClientSession, counts Counts) {
+func updateState(name string, state State, err error, client *ClientSession, counts Counts) {
 	info := ClientInfo{
 		Name:   name,
 		State:  state,
@@ -294,7 +348,7 @@ func updateState(name string, state State, err error, client *mcp.ClientSession,
 	})
 }
 
-func createSession(ctx context.Context, name string, m config.MCPConfig, resolver config.VariableResolver) (*mcp.ClientSession, error) {
+func createSession(ctx context.Context, name string, m config.MCPConfig, resolver config.VariableResolver) (*ClientSession, error) {
 	timeout := mcpTimeout(m)
 	mcpCtx, cancel := context.WithCancel(ctx)
 	cancelTimer := time.AfterFunc(timeout, cancel)
@@ -352,7 +406,7 @@ func createSession(ctx context.Context, name string, m config.MCPConfig, resolve
 
 	cancelTimer.Stop()
 	slog.Debug("MCP client initialized", "name", name)
-	return session, nil
+	return &ClientSession{session, cancel}, nil
 }
 
 // maybeStdioErr if a stdio mcp prints an error in non-json format, it'll fail

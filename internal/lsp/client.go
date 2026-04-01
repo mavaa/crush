@@ -8,13 +8,13 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/charmbracelet/crush/internal/fsext"
 	"github.com/charmbracelet/crush/internal/home"
 	powernap "github.com/charmbracelet/x/powernap/pkg/lsp"
 	"github.com/charmbracelet/x/powernap/pkg/lsp/protocol"
@@ -35,7 +35,7 @@ type Client struct {
 	debug  bool
 
 	// Working directory this LSP is scoped to.
-	workDir string
+	cwd string
 
 	// File types this LSP server handles (e.g., .go, .rs, .py)
 	fileTypes []string
@@ -66,7 +66,14 @@ type Client struct {
 }
 
 // New creates a new LSP client using the powernap implementation.
-func New(ctx context.Context, name string, cfg config.LSPConfig, resolver config.VariableResolver, debug bool) (*Client, error) {
+func New(
+	ctx context.Context,
+	name string,
+	cfg config.LSPConfig,
+	resolver config.VariableResolver,
+	cwd string,
+	debug bool,
+) (*Client, error) {
 	client := &Client{
 		name:        name,
 		fileTypes:   cfg.FileTypes,
@@ -76,8 +83,9 @@ func New(ctx context.Context, name string, cfg config.LSPConfig, resolver config
 		ctx:         ctx,
 		debug:       debug,
 		resolver:    resolver,
+		cwd:         cwd,
 	}
-	client.serverState.Store(StateStarting)
+	client.serverState.Store(StateStopped)
 
 	if err := client.createPowernapClient(); err != nil {
 		return nil, err
@@ -117,27 +125,43 @@ func (c *Client) Initialize(ctx context.Context, workspaceDir string) (*protocol
 	return result, nil
 }
 
-// Close closes the LSP client.
+// closeTimeout is the maximum time to wait for a graceful LSP shutdown.
+const closeTimeout = 5 * time.Second
+
+// Kill kills the client without doing anything else.
+func (c *Client) Kill() { c.client.Kill() }
+
+// Close closes all open files in the client, then shuts down gracefully.
+// If shutdown takes longer than closeTimeout, it falls back to Kill().
 func (c *Client) Close(ctx context.Context) error {
 	c.CloseAllFiles(ctx)
 
-	// Shutdown and exit the client
-	if err := c.client.Shutdown(ctx); err != nil {
-		slog.Warn("Failed to shutdown LSP client", "error", err)
-	}
+	// Use a timeout to prevent hanging on unresponsive LSP servers.
+	// jsonrpc2's send lock doesn't respect context cancellation, so we
+	// need to fall back to Kill() which closes the underlying connection.
+	closeCtx, cancel := context.WithTimeout(ctx, closeTimeout)
+	defer cancel()
 
-	return c.client.Exit()
+	done := make(chan error, 1)
+	go func() {
+		if err := c.client.Shutdown(closeCtx); err != nil {
+			slog.Warn("Failed to shutdown LSP client", "error", err)
+		}
+		done <- c.client.Exit()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-closeCtx.Done():
+		c.client.Kill()
+		return closeCtx.Err()
+	}
 }
 
 // createPowernapClient creates a new powernap client with the current configuration.
 func (c *Client) createPowernapClient() error {
-	workDir, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get working directory: %w", err)
-	}
-
-	rootURI := string(protocol.URIFromPath(workDir))
-	c.workDir = workDir
+	rootURI := string(protocol.URIFromPath(c.cwd))
 
 	command, err := c.resolver.ResolveValue(c.config.Command)
 	if err != nil {
@@ -154,7 +178,7 @@ func (c *Client) createPowernapClient() error {
 		WorkspaceFolders: []protocol.WorkspaceFolder{
 			{
 				URI:  rootURI,
-				Name: filepath.Base(workDir),
+				Name: filepath.Base(c.cwd),
 			},
 		},
 	}
@@ -170,7 +194,7 @@ func (c *Client) createPowernapClient() error {
 
 // registerHandlers registers the standard LSP notification and request handlers.
 func (c *Client) registerHandlers() {
-	c.RegisterServerRequestHandler("workspace/applyEdit", HandleApplyEdit)
+	c.RegisterServerRequestHandler("workspace/applyEdit", HandleApplyEdit(c.client.GetOffsetEncoding()))
 	c.RegisterServerRequestHandler("workspace/configuration", HandleWorkspaceConfiguration)
 	c.RegisterServerRequestHandler("client/registerCapability", HandleRegisterCapability)
 	c.RegisterNotificationHandler("window/showMessage", func(ctx context.Context, method string, params json.RawMessage) {
@@ -236,10 +260,11 @@ func (c *Client) Restart() error {
 type ServerState int
 
 const (
-	StateStopped ServerState = iota
+	StateUnstarted ServerState = iota
 	StateStarting
 	StateReady
 	StateError
+	StateStopped
 	StateDisabled
 )
 
@@ -270,10 +295,6 @@ func (c *Client) SetDiagnosticsCallback(callback func(name string, count int)) {
 func (c *Client) WaitForServerReady(ctx context.Context) error {
 	// Set initial state
 	c.SetServerState(StateStarting)
-
-	// Create a context with timeout
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 
 	// Try to ping the server with a simple request
 	ticker := time.NewTicker(500 * time.Millisecond)
@@ -318,37 +339,14 @@ type OpenFileInfo struct {
 // HandlesFile checks if this LSP client handles the given file based on its
 // extension and whether it's within the working directory.
 func (c *Client) HandlesFile(path string) bool {
-	// Check if file is within working directory.
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		slog.Debug("Cannot resolve path", "name", c.name, "file", path, "error", err)
+	if c == nil {
 		return false
 	}
-	relPath, err := filepath.Rel(c.workDir, absPath)
-	if err != nil || strings.HasPrefix(relPath, "..") {
-		slog.Debug("File outside workspace", "name", c.name, "file", path, "workDir", c.workDir)
+	if !fsext.HasPrefix(path, c.cwd) {
+		slog.Debug("File outside workspace", "name", c.name, "file", path, "workDir", c.cwd)
 		return false
 	}
-
-	// If no file types are specified, handle all files (backward compatibility).
-	if len(c.fileTypes) == 0 {
-		return true
-	}
-
-	kind := powernap.DetectLanguage(path)
-	name := strings.ToLower(filepath.Base(path))
-	for _, filetype := range c.fileTypes {
-		suffix := strings.ToLower(filetype)
-		if !strings.HasPrefix(suffix, ".") {
-			suffix = "." + suffix
-		}
-		if strings.HasSuffix(name, suffix) || filetype == string(kind) {
-			slog.Debug("Handles file", "name", c.name, "file", name, "filetype", filetype, "kind", kind)
-			return true
-		}
-	}
-	slog.Debug("Doesn't handle file", "name", c.name, "file", name)
-	return false
+	return handlesFiletype(c.name, c.fileTypes, path)
 }
 
 // OpenFile opens a file in the LSP server.
@@ -384,6 +382,9 @@ func (c *Client) OpenFile(ctx context.Context, filepath string) error {
 
 // NotifyChange notifies the server about a file change.
 func (c *Client) NotifyChange(ctx context.Context, filepath string) error {
+	if c == nil {
+		return nil
+	}
 	uri := string(protocol.URIFromPath(filepath))
 
 	content, err := os.ReadFile(filepath)
@@ -440,12 +441,18 @@ func (c *Client) GetFileDiagnostics(uri protocol.DocumentURI) []protocol.Diagnos
 
 // GetDiagnostics returns all diagnostics for all files.
 func (c *Client) GetDiagnostics() map[protocol.DocumentURI][]protocol.Diagnostic {
+	if c == nil {
+		return nil
+	}
 	return c.diagnostics.Copy()
 }
 
 // GetDiagnosticCounts returns cached diagnostic counts by severity.
 // Uses the VersionedMap version to avoid recomputing on every call.
 func (c *Client) GetDiagnosticCounts() DiagnosticCounts {
+	if c == nil {
+		return DiagnosticCounts{}
+	}
 	currentVersion := c.diagnostics.Version()
 
 	c.diagCountsMu.Lock()
@@ -479,6 +486,9 @@ func (c *Client) GetDiagnosticCounts() DiagnosticCounts {
 
 // OpenFileOnDemand opens a file only if it's not already open.
 func (c *Client) OpenFileOnDemand(ctx context.Context, filepath string) error {
+	if c == nil {
+		return nil
+	}
 	// Check if the file is already open
 	if c.IsFileOpen(filepath) {
 		return nil
@@ -486,31 +496,6 @@ func (c *Client) OpenFileOnDemand(ctx context.Context, filepath string) error {
 
 	// Open the file
 	return c.OpenFile(ctx, filepath)
-}
-
-// GetDiagnosticsForFile ensures a file is open and returns its diagnostics.
-func (c *Client) GetDiagnosticsForFile(ctx context.Context, filepath string) ([]protocol.Diagnostic, error) {
-	documentURI := protocol.URIFromPath(filepath)
-
-	// Make sure the file is open
-	if !c.IsFileOpen(filepath) {
-		if err := c.OpenFile(ctx, filepath); err != nil {
-			return nil, fmt.Errorf("failed to open file for diagnostics: %w", err)
-		}
-
-		// Give the LSP server a moment to process the file
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	// Get diagnostics
-	diagnostics, _ := c.diagnostics.Get(documentURI)
-
-	return diagnostics, nil
-}
-
-// ClearDiagnosticsForURI removes diagnostics for a specific URI from the cache.
-func (c *Client) ClearDiagnosticsForURI(uri protocol.DocumentURI) {
-	c.diagnostics.Del(uri)
 }
 
 // RegisterNotificationHandler registers a notification handler.
@@ -523,21 +508,11 @@ func (c *Client) RegisterServerRequestHandler(method string, handler transport.H
 	c.client.RegisterHandler(method, handler)
 }
 
-// DidChangeWatchedFiles sends a workspace/didChangeWatchedFiles notification to the server.
-func (c *Client) DidChangeWatchedFiles(ctx context.Context, params protocol.DidChangeWatchedFilesParams) error {
-	return c.client.NotifyDidChangeWatchedFiles(ctx, params.Changes)
-}
-
 // openKeyConfigFiles opens important configuration files that help initialize the server.
 func (c *Client) openKeyConfigFiles(ctx context.Context) {
-	wd, err := os.Getwd()
-	if err != nil {
-		return
-	}
-
 	// Try to open each file, ignoring errors if they don't exist
 	for _, file := range c.config.RootMarkers {
-		file = filepath.Join(wd, file)
+		file = filepath.Join(c.cwd, file)
 		if _, err := os.Stat(file); err == nil {
 			// File exists, try to open it
 			if err := c.OpenFile(ctx, file); err != nil {
@@ -551,6 +526,9 @@ func (c *Client) openKeyConfigFiles(ctx context.Context) {
 
 // WaitForDiagnostics waits until diagnostics change or the timeout is reached.
 func (c *Client) WaitForDiagnostics(ctx context.Context, d time.Duration) {
+	if c == nil {
+		return
+	}
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	timeout := time.After(d)
@@ -574,6 +552,11 @@ func (c *Client) FindReferences(ctx context.Context, filepath string, line, char
 	if err := c.OpenFileOnDemand(ctx, filepath); err != nil {
 		return nil, err
 	}
+
+	// Add timeout to prevent hanging on slow LSP servers.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	// NOTE: line and character should be 0-based.
 	// See: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#position
 	return c.client.FindReferences(ctx, filepath, line-1, character-1, includeDeclaration)

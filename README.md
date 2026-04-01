@@ -191,6 +191,7 @@ That said, you can also set environment variables for preferred providers.
 | `HF_TOKEN`                  | Hugging Face Inference                             |
 | `CEREBRAS_API_KEY`          | Cerebras                                           |
 | `OPENROUTER_API_KEY`        | OpenRouter                                         |
+| `IONET_API_KEY`             | io.net                                             |
 | `GROQ_API_KEY`              | Groq                                               |
 | `VERTEXAI_PROJECT`          | Google Cloud VertexAI (Gemini)                     |
 | `VERTEXAI_LOCATION`         | Google Cloud VertexAI (Gemini)                     |
@@ -202,6 +203,16 @@ That said, you can also set environment variables for preferred providers.
 | `AZURE_OPENAI_API_ENDPOINT` | Azure OpenAI models                                |
 | `AZURE_OPENAI_API_KEY`      | Azure OpenAI models (optional when using Entra ID) |
 | `AZURE_OPENAI_API_VERSION`  | Azure OpenAI models                                |
+
+### Subscriptions
+
+If you prefer subscription-based usage, here are some plans that work well in
+Crush:
+
+- [Synthetic](https://synthetic.new/pricing)
+- [GLM Coding Plan](https://z.ai/subscribe)
+- [Kimi Code](https://www.kimi.com/membership/pricing)
+- [MiniMax Coding Plan](https://platform.minimax.io/subscribe/coding-plan)
 
 ### By the Way
 
@@ -377,11 +388,23 @@ extending agent capabilities with reusable skill packages. Skills are folders
 containing a `SKILL.md` file with instructions that Crush can discover and
 activate on demand.
 
-Skills are discovered from:
+The global paths we looks for skills are:
 
-- `~/.config/crush/skills/` on Unix (default, can be overridden with `CRUSH_SKILLS_DIR`)
-- `%LOCALAPPDATA%\crush\skills\` on Windows (default, can be overridden with `CRUSH_SKILLS_DIR`)
-- Additional paths configured via `options.skills_paths`
+* `$CRUSH_SKILLS_DIR`
+* `$XDG_CONFIG_HOME/agents/skills` or `~/.config/agents/skills/`
+* `$XDG_CONFIG_HOME/crush/skills` or `~/.config/crush/skills/`
+* On Windows, we _also_ look at
+  * `%LOCALAPPDATA%\agents\skills\` or `%USERPROFILE%\AppData\Local\agents\skills\`
+  * `%LOCALAPPDATA%\crush\skills\` or `%USERPROFILE%\AppData\Local\crush\skills\`
+* Additional paths configured via `options.skills_paths`
+
+On top of that, we _also_ load skills in your project from the following
+relative paths:
+
+* `.agents/skills`
+* `.crush/skills`
+* `.claude/skills`
+* `.cursor/skills`
 
 ```jsonc
 {
@@ -412,6 +435,25 @@ cd "$env:LOCALAPPDATA\crush\skills"
 git clone https://github.com/anthropics/skills.git _temp
 mv _temp/skills/* . ; rm -r -force _temp
 ```
+
+### Desktop notifications
+
+Crush sends desktop notifications when a tool call requires permission and when
+the agent finishes its turn. They're only sent when the terminal window isn't
+focused _and_ your terminal supports reporting the focus state.
+
+```jsonc
+{
+  "$schema": "https://charm.land/crush.json",
+  "options": {
+    "disable_notifications": false // default
+  }
+}
+```
+
+To disable desktop notifications, set `disable_notifications` to `true` in your
+configuration. On macOS, notifications currently lack icons due to platform
+limitations.
 
 ### Initialization
 
@@ -741,6 +783,19 @@ Or by setting the following in your config:
 
 Crush also respects the `DO_NOT_TRACK` convention which can be enabled via
 `export DO_NOT_TRACK=1`.
+
+## Q&A
+
+### Why is clipboard copy and paste not working?
+
+Installing an extra tool might be needed on Unix-like environments.
+
+| Environment         | Tool                     |
+| ------------------- | ------------------------ |
+| Windows             | Native support           |
+| macOS               | Native support           |
+| Linux/BSD + Wayland | `wl-copy` and `wl-paste` |
+| Linux/BSD + X11     | `xclip` or `xsel`        |
 
 ## Contributing
 

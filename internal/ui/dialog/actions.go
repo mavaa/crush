@@ -36,25 +36,29 @@ type ActionSelectSession struct {
 
 // ActionSelectModel is a message indicating a model has been selected.
 type ActionSelectModel struct {
-	Provider  catwalk.Provider
-	Model     config.SelectedModel
-	ModelType config.SelectedModelType
+	Provider       catwalk.Provider
+	Model          config.SelectedModel
+	ModelType      config.SelectedModelType
+	ReAuthenticate bool
 }
 
 // Messages for commands
 type (
-	ActionNewSession        struct{}
-	ActionToggleHelp        struct{}
-	ActionToggleCompactMode struct{}
-	ActionToggleThinking    struct{}
-	ActionExternalEditor    struct{}
-	ActionToggleYoloMode    struct{}
-	// ActionInitializeProject is a message to initialize a project.
-	ActionInitializeProject struct{}
-	ActionSummarize         struct {
+	ActionNewSession                  struct{}
+	ActionToggleHelp                  struct{}
+	ActionToggleCompactMode           struct{}
+	ActionToggleThinking              struct{}
+	ActionTogglePills                 struct{}
+	ActionExternalEditor              struct{}
+	ActionToggleYoloMode              struct{}
+	ActionToggleNotifications         struct{}
+	ActionToggleTransparentBackground struct{}
+	ActionInitializeProject           struct{}
+	ActionSummarize                   struct {
 		SessionID string
 	}
-	// ActionSelectReasoningEffort is a message indicating a reasoning effort has been selected.
+	// ActionSelectReasoningEffort is a message indicating a reasoning effort
+	// has been selected.
 	ActionSelectReasoningEffort struct {
 		Effort string
 	}
@@ -77,6 +81,10 @@ type (
 		Arguments   []commands.Argument
 		Args        map[string]string // Actual argument values
 	}
+	// ActionEnableDockerMCP is a message to enable Docker MCP.
+	ActionEnableDockerMCP struct{}
+	// ActionDisableDockerMCP is a message to disable Docker MCP.
+	ActionDisableDockerMCP struct{}
 )
 
 // Messages for API key input dialog.

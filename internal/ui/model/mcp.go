@@ -6,6 +6,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
+	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/ui/common"
 	"github.com/charmbracelet/crush/internal/ui/styles"
 )
@@ -22,11 +23,11 @@ func (m *UI) mcpInfo(width, maxItems int, isSection bool) string {
 		}
 	}
 
-	title := t.Subtle.Render("MCPs")
+	title := t.ResourceGroupTitle.Render("MCPs")
 	if isSection {
 		title = common.Section(t, title, width)
 	}
-	list := t.Subtle.Render("None")
+	list := t.ResourceAdditionalText.Render("None")
 	if len(mcps) > 0 {
 		list = mcpList(t, mcps, width, maxItems)
 	}
@@ -60,27 +61,32 @@ func mcpList(t *styles.Styles, mcps []mcp.ClientInfo, width, maxItems int) strin
 	for _, m := range mcps {
 		var icon string
 		title := m.Name
+		// Show "Docker MCP" instead of the config name for Docker MCP.
+		if m.Name == config.DockerMCPName {
+			title = "Docker MCP"
+		}
+		title = t.ResourceName.Render(title)
 		var description string
 		var extraContent string
 
 		switch m.State {
 		case mcp.StateStarting:
-			icon = t.ItemBusyIcon.String()
-			description = t.Subtle.Render("starting...")
+			icon = t.ResourceBusyIcon.String()
+			description = t.ResourceStatus.Render("starting...")
 		case mcp.StateConnected:
-			icon = t.ItemOnlineIcon.String()
+			icon = t.ResourceOnlineIcon.String()
 			extraContent = mcpCounts(t, m.Counts)
 		case mcp.StateError:
-			icon = t.ItemErrorIcon.String()
-			description = t.Subtle.Render("error")
+			icon = t.ResourceErrorIcon.String()
+			description = t.ResourceStatus.Render("error")
 			if m.Error != nil {
-				description = t.Subtle.Render(fmt.Sprintf("error: %s", m.Error.Error()))
+				description = t.ResourceStatus.Render(fmt.Sprintf("error: %s", m.Error.Error()))
 			}
 		case mcp.StateDisabled:
-			icon = t.ItemOfflineIcon.Foreground(t.Muted.GetBackground()).String()
-			description = t.Subtle.Render("disabled")
+			icon = t.ResourceOfflineIcon.Foreground(t.Muted.GetBackground()).String()
+			description = t.ResourceStatus.Render("disabled")
 		default:
-			icon = t.ItemOfflineIcon.String()
+			icon = t.ResourceOfflineIcon.String()
 		}
 
 		renderedMcps = append(renderedMcps, common.Status(t, common.StatusOpts{
@@ -94,7 +100,7 @@ func mcpList(t *styles.Styles, mcps []mcp.ClientInfo, width, maxItems int) strin
 	if len(renderedMcps) > maxItems {
 		visibleItems := renderedMcps[:maxItems-1]
 		remaining := len(renderedMcps) - maxItems
-		visibleItems = append(visibleItems, t.Subtle.Render(fmt.Sprintf("…and %d more", remaining)))
+		visibleItems = append(visibleItems, t.ResourceAdditionalText.Render(fmt.Sprintf("…and %d more", remaining)))
 		return lipgloss.JoinVertical(lipgloss.Left, visibleItems...)
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, renderedMcps...)

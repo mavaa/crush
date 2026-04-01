@@ -47,7 +47,7 @@ func (c *Capabilities) Update(msg any) {
 	case tea.WindowSizeMsg:
 		c.Columns = m.Width
 		c.Rows = m.Height
-	case uv.WindowPixelSizeEvent:
+	case uv.PixelSizeEvent:
 		c.PixelX = m.Width
 		c.PixelY = m.Height
 	case uv.KittyGraphicsEvent:
@@ -58,7 +58,7 @@ func (c *Capabilities) Update(msg any) {
 		}
 	case tea.TerminalVersionMsg:
 		c.TerminalVersion = m.Name
-	case uv.ModeReportEvent:
+	case tea.ModeReportMsg:
 		switch m.Mode {
 		case ansi.ModeFocusEvent:
 			c.ReportFocusEvents = modeSupported(m.Value)
@@ -71,12 +71,13 @@ func (c *Capabilities) Update(msg any) {
 func QueryCmd(env uv.Environ) tea.Cmd {
 	var sb strings.Builder
 	sb.WriteString(ansi.RequestPrimaryDeviceAttributes)
+	sb.WriteString(ansi.QueryModifyOtherKeys)
 
 	// Queries that should only be sent to "smart" normal terminals.
 	shouldQueryFor := shouldQueryCapabilities(env)
 	if shouldQueryFor {
 		sb.WriteString(ansi.RequestNameVersion)
-		// sb.WriteString(ansi.RequestModeFocusEvent) // TODO: re-enable when we need notifications.
+		sb.WriteString(ansi.RequestModeFocusEvent)
 		sb.WriteString(ansi.WindowOp(14)) // Window size in pixels
 		kittyReq := ansi.KittyGraphics([]byte("AAAA"), "i=31", "s=1", "v=1", "a=q", "t=d", "f=24")
 		if _, isTmux := env.LookupEnv("TMUX"); isTmux {
