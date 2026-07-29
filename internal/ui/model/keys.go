@@ -69,6 +69,7 @@ type KeyMap struct {
 	Sessions   key.Binding
 	Tab        key.Binding
 	ToggleYolo key.Binding
+	HidePermissionDialog key.Binding
 }
 
 func DefaultKeyMap() KeyMap {
@@ -104,6 +105,10 @@ func DefaultKeyMap() KeyMap {
 		ToggleYolo: key.NewBinding(
 			key.WithKeys("ctrl+y"),
 			key.WithHelp("ctrl+y", "toggle yolo"),
+		),
+		HidePermissionDialog: key.NewBinding(
+			key.WithKeys("ctrl+h"),
+			key.WithHelp("ctrl+h", "hide permission dialog"),
 		),
 	}
 

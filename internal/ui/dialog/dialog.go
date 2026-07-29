@@ -90,6 +90,16 @@ func (d *Overlay) HasDialogs() bool {
 	return len(d.dialogs) > 0
 }
 
+// HasDialogsExcept checks if there are dialogs other than the specified ID.
+func (d *Overlay) HasDialogsExcept(dialogID string) bool {
+	for _, dialog := range d.dialogs {
+		if dialog.ID() != dialogID {
+			return true
+		}
+	}
+	return len(d.dialogs) > 1
+}
+
 // ContainsDialog checks if a dialog with the specified ID exists.
 func (d *Overlay) ContainsDialog(dialogID string) bool {
 	for _, dialog := range d.dialogs {
@@ -200,6 +210,14 @@ func (d *Overlay) DialogLast() Dialog {
 	return d.dialogs[len(d.dialogs)-1]
 }
 
+// FrontDialogID returns the ID of the topmost dialog.
+func (d *Overlay) FrontDialogID() string {
+	if len(d.dialogs) == 0 {
+		return ""
+	}
+	return d.dialogs[len(d.dialogs)-1].ID()
+}
+
 // BringToFront brings the dialog with the specified ID to the front.
 func (d *Overlay) BringToFront(dialogID string) {
 	for i, dialog := range d.dialogs {
@@ -297,6 +315,18 @@ func DrawOnboardingCursor(scr uv.Screen, area uv.Rectangle, view string, cur *te
 func (d *Overlay) Draw(scr uv.Screen, area uv.Rectangle) *tea.Cursor {
 	var cur *tea.Cursor
 	for _, dialog := range d.dialogs {
+		cur = dialog.Draw(scr, area)
+	}
+	return cur
+}
+
+// DrawExcept renders the overlay and its dialogs, skipping the specified dialog.
+func (d *Overlay) DrawExcept(dialogID string, scr uv.Screen, area uv.Rectangle) *tea.Cursor {
+	var cur *tea.Cursor
+	for _, dialog := range d.dialogs {
+		if dialog.ID() == dialogID {
+			continue
+		}
 		cur = dialog.Draw(scr, area)
 	}
 	return cur

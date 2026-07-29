@@ -351,6 +351,7 @@ func (m *Models) setProviderItems() error {
 	selectedType := m.modelType.Config()
 	currentModel := cfg.Models[selectedType]
 	recentItems := cfg.RecentModels[selectedType]
+	showOnlyConfiguredProviders := !m.isOnboarding && cfg.Options.ShowOnlyConfiguredProviders
 
 	// Track providers already added to avoid duplicates
 	addedProviders := make(map[string]bool)
@@ -410,6 +411,9 @@ func (m *Models) setProviderItems() error {
 
 		providerConfig, providerConfigured := cfg.Providers.Get(providerID)
 		if providerConfigured && providerConfig.Disable {
+			continue
+		}
+		if showOnlyConfiguredProviders && !providerConfigured {
 			continue
 		}
 
