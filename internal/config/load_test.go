@@ -265,9 +265,34 @@ func TestConfig_setDefaults(t *testing.T) {
 		require.NotNil(t, cfg.MCP)
 		require.Equal(t, filepath.Join(workingDir, ".crush"), cfg.Options.DataDirectory)
 		require.Equal(t, "AGENTS.md", cfg.Options.InitializeAs)
+		// DiffMode is deliberately left empty: the permissions dialog treats
+		// the zero value as "pick split or unified based on terminal width".
+		require.Empty(t, cfg.Options.TUI.DiffMode)
+		require.Equal(t, ScrollbarDefault, cfg.Options.TUI.Scrollbar)
+		require.Equal(t, ExitBannerDefault, cfg.Options.TUI.ExitBanner)
 		for _, path := range defaultContextPaths {
 			require.Contains(t, cfg.Options.ContextPaths, path)
 		}
+	})
+
+	t.Run("sets TUI defaults only when unset", func(t *testing.T) {
+		cfg := &Config{}
+		workingDir := t.TempDir()
+
+		cfg.setDefaults(workingDir, "")
+
+		require.Empty(t, cfg.Options.TUI.DiffMode)
+		require.Equal(t, ScrollbarDefault, cfg.Options.TUI.Scrollbar)
+		require.Equal(t, ExitBannerDefault, cfg.Options.TUI.ExitBanner)
+
+		cfg.Options.TUI.DiffMode = DiffModeSplit
+		cfg.Options.TUI.Scrollbar = ScrollbarNever
+		cfg.Options.TUI.ExitBanner = ExitBannerCompact
+		cfg.setDefaults(workingDir, "")
+
+		require.Equal(t, DiffModeSplit, cfg.Options.TUI.DiffMode)
+		require.Equal(t, ScrollbarNever, cfg.Options.TUI.Scrollbar)
+		require.Equal(t, ExitBannerCompact, cfg.Options.TUI.ExitBanner)
 	})
 
 	t.Run("prunes orphaned OAuth token MCP entries but keeps real ones", func(t *testing.T) {
@@ -790,6 +815,10 @@ func TestConfig_setupAgentsWithNoDisabledTools(t *testing.T) {
 	taskAgent, ok := cfg.Agents[AgentTask]
 	require.True(t, ok)
 	assert.Equal(t, []string{"lsp_symbols", "lsp_definition", "lsp_call_hierarchy", "glob", "grep", "ls", "sourcegraph", "view"}, taskAgent.AllowedTools)
+
+	planAgent, ok := cfg.Agents[AgentPlan]
+	require.True(t, ok)
+	assert.Equal(t, []string{"agent", "lsp_symbols", "lsp_definition", "lsp_call_hierarchy", "glob", "grep", "ls", "question", "sourcegraph", "view"}, planAgent.AllowedTools)
 }
 
 func TestConfig_setupAgentsWithDisabledTools(t *testing.T) {
@@ -812,12 +841,17 @@ func TestConfig_setupAgentsWithDisabledTools(t *testing.T) {
 	taskAgent, ok := cfg.Agents[AgentTask]
 	require.True(t, ok)
 	assert.Equal(t, []string{"lsp_symbols", "lsp_definition", "lsp_call_hierarchy", "glob", "ls", "sourcegraph", "view"}, taskAgent.AllowedTools)
+
+	planAgent, ok := cfg.Agents[AgentPlan]
+	require.True(t, ok)
+	assert.Equal(t, []string{"agent", "lsp_symbols", "lsp_definition", "lsp_call_hierarchy", "glob", "ls", "question", "sourcegraph", "view"}, planAgent.AllowedTools)
 }
 
 func TestConfig_setupAgentsWithEveryReadOnlyToolDisabled(t *testing.T) {
 	cfg := &Config{
 		Options: &Options{
 			DisabledTools: []string{
+				"agent",
 				"glob",
 				"grep",
 				"ls",
@@ -833,11 +867,15 @@ func TestConfig_setupAgentsWithEveryReadOnlyToolDisabled(t *testing.T) {
 	cfg.SetupAgents()
 	coderAgent, ok := cfg.Agents[AgentCoder]
 	require.True(t, ok)
-	assert.Equal(t, []string{"agent", "bash", "crush_info", "crush_logs", "job_output", "job_kill", "download", "edit", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "lsp_rename", "lsp_replace_symbol", "fetch", "agentic_fetch", "question", "todos", "write", "list_mcp_resources", "read_mcp_resource"}, coderAgent.AllowedTools)
+	assert.Equal(t, []string{"bash", "crush_info", "crush_logs", "job_output", "job_kill", "download", "edit", "multiedit", "lsp_diagnostics", "lsp_references", "lsp_restart", "lsp_rename", "lsp_replace_symbol", "fetch", "agentic_fetch", "question", "todos", "write", "list_mcp_resources", "read_mcp_resource"}, coderAgent.AllowedTools)
 
 	taskAgent, ok := cfg.Agents[AgentTask]
 	require.True(t, ok)
 	assert.Len(t, taskAgent.AllowedTools, 0)
+
+	planAgent, ok := cfg.Agents[AgentPlan]
+	require.True(t, ok)
+	assert.Equal(t, []string{"question"}, planAgent.AllowedTools)
 }
 
 func TestConfig_configureProvidersWithDisabledProvider(t *testing.T) {
@@ -922,6 +960,101 @@ func TestConfig_configureProvidersCustomProviderValidation(t *testing.T) {
 		require.Equal(t, cfg.Providers.Len(), 0)
 		_, exists := cfg.Providers.Get("custom")
 		require.False(t, exists)
+	})
+
+	t.Run("custom provider with shell-expanded BaseURL is kept", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"custom": {
+					APIKey:  "test-key",
+					BaseURL: "$(echo https://api.custom.com/v1)",
+					Models: []catwalk.Model{{
+						ID: "test-model",
+					}},
+				},
+			}),
+		}
+		cfg.setDefaults("/tmp", "")
+
+		env := env.NewFromMap(map[string]string{})
+		resolver := NewShellVariableResolver(env)
+		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, []catwalk.Provider{})
+		require.NoError(t, err)
+
+		require.Equal(t, 1, cfg.Providers.Len())
+		_, exists := cfg.Providers.Get("custom")
+		require.True(t, exists, "a BaseURL supplied via shell expansion must pass endpoint validation")
+	})
+
+	t.Run("custom provider with env var BaseURL is kept", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"custom": {
+					APIKey:  "test-key",
+					BaseURL: "$CUSTOM_API_URL",
+					Models: []catwalk.Model{{
+						ID: "test-model",
+					}},
+				},
+			}),
+		}
+		cfg.setDefaults("/tmp", "")
+
+		env := env.NewFromMap(map[string]string{
+			"CUSTOM_API_URL": "https://api.custom.com/v1",
+		})
+		resolver := NewShellVariableResolver(env)
+		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, []catwalk.Provider{})
+		require.NoError(t, err)
+
+		require.Equal(t, 1, cfg.Providers.Len())
+		_, exists := cfg.Providers.Get("custom")
+		require.True(t, exists, "a BaseURL supplied via an env variable must pass endpoint validation")
+	})
+
+	t.Run("custom provider whose BaseURL resolves to empty is removed", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"custom": {
+					APIKey:  "test-key",
+					BaseURL: "$MISSING_API_URL",
+					Models: []catwalk.Model{{
+						ID: "test-model",
+					}},
+				},
+			}),
+		}
+		cfg.setDefaults("/tmp", "")
+
+		env := env.NewFromMap(map[string]string{})
+		resolver := NewShellVariableResolver(env)
+		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, []catwalk.Provider{})
+		require.NoError(t, err)
+
+		require.Equal(t, 0, cfg.Providers.Len())
+		_, exists := cfg.Providers.Get("custom")
+		require.False(t, exists, "a raw-non-empty BaseURL that resolves to empty must be rejected")
+	})
+
+	t.Run("BaseURL resolving to empty with disable_default_providers returns an error", func(t *testing.T) {
+		cfg := &Config{
+			Providers: csync.NewMapFrom(map[string]ProviderConfig{
+				"custom": {
+					APIKey:  "test-key",
+					BaseURL: "$MISSING_API_URL",
+					Models: []catwalk.Model{{
+						ID: "test-model",
+					}},
+				},
+			}),
+		}
+		cfg.setDefaults("/tmp", "")
+		cfg.Options.DisableDefaultProviders = true
+
+		env := env.NewFromMap(map[string]string{})
+		resolver := NewShellVariableResolver(env)
+		err := cfg.configureProviders(context.Background(), testStore(cfg), env, resolver, []catwalk.Provider{})
+		require.Error(t, err, "the sole custom provider is invalid after resolution, so configuration must fail")
 	})
 
 	t.Run("custom provider with no models attempts discovery and is removed on failure", func(t *testing.T) {

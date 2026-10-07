@@ -107,6 +107,12 @@ type AgentInitRequest struct {
 	Interactive bool `json:"interactive"`
 }
 
+// AgentSetMainRequest requests switching the workspace's active agent
+// (e.g. "coder" or "plan").
+type AgentSetMainRequest struct {
+	AgentID string `json:"agent_id"`
+}
+
 // LSPStartRequest represents a request to start an LSP for a path.
 type LSPStartRequest struct {
 	Path string `json:"path"`
@@ -121,6 +127,13 @@ type FileTrackerReadRequest struct {
 // MCPNameRequest represents a request targeting a named MCP server.
 type MCPNameRequest struct {
 	Name string `json:"name"`
+}
+
+// MCPSetServerDisabledRequest toggles a repository-scoped MCP server
+// override for the workspace's Toggle MCPs dialog.
+type MCPSetServerDisabledRequest struct {
+	Name     string `json:"name"`
+	Disabled bool   `json:"disabled"`
 }
 
 // MCPPendingAuthServer describes an MCP server awaiting OAuth

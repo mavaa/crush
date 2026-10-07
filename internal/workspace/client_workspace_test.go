@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/app"
 	"github.com/charmbracelet/crush/internal/client"
 	"github.com/charmbracelet/crush/internal/commands"
@@ -60,6 +61,35 @@ func TestProtoToMessageToolResult(t *testing.T) {
 	require.Equal(t, `{"file_path":"/tmp/x","content":"hi"}`, tr.Metadata)
 	require.False(t, tr.IsError)
 }
+
+// TestProtoToMessagePrismModel ensures the Prism-routed model fields survive
+// the conversion from proto. Without them the client TUI cannot show which
+// model actually served each turn on Hyper's model router.
+func TestProtoToMessagePrismModel(t *testing.T) {
+	t.Parallel()
+
+	src := proto.Message{
+		ID:             "m1",
+		Role:           proto.Assistant,
+		Model:          "prism-model",
+		Provider:       "hyper",
+		PrismModelID:   "prism-42",
+		PrismModelName: "GLM 5.3",
+
+		PrismHypercreditSavings: protoPtrFloat(1.5),
+		PrismDollarSavings:      protoPtrFloat(0.002),
+	}
+
+	got := protoToMessage(src)
+	require.Equal(t, "prism-42", got.PrismModelID)
+	require.Equal(t, "GLM 5.3", got.PrismModelName)
+	require.NotNil(t, got.PrismHypercreditSavings)
+	require.Equal(t, 1.5, *got.PrismHypercreditSavings)
+	require.NotNil(t, got.PrismDollarSavings)
+	require.Equal(t, 0.002, *got.PrismDollarSavings)
+}
+
+func protoPtrFloat(v float64) *float64 { return &v }
 
 // TestClientWorkspace_PermissionGrantMapping verifies that
 // PermissionGrant on the ClientWorkspace serializes a one-time grant
@@ -195,6 +225,30 @@ func TestTranslateEvent_Skills(t *testing.T) {
 	cached := skills.GetLatestStates()
 	require.Len(t, cached, 1)
 	require.Equal(t, "from-server", cached[0].Name)
+}
+
+// TestTranslateEvent_MCPChannel verifies the client reconstructs a channel
+// push from the wire with its type and rendered <channel> body intact, so the
+// TUI's channel handler fires in client/server mode.
+func TestTranslateEvent_MCPChannel(t *testing.T) {
+	t.Parallel()
+
+	w := NewClientWorkspace(nil, proto.Workspace{})
+	ev := pubsub.Event[proto.MCPEvent]{
+		Type: pubsub.CreatedEvent,
+		Payload: proto.MCPEvent{
+			Type:           proto.MCPEventChannelMessage,
+			Name:           "webhook",
+			ChannelMessage: `<channel source="webhook">build failed</channel>`,
+		},
+	}
+
+	out := w.translateEvent(ev)
+	got, ok := out.(pubsub.Event[mcp.Event])
+	require.True(t, ok, "expected pubsub.Event[mcp.Event], got %T", out)
+	require.Equal(t, mcp.EventChannelMessage, got.Payload.Type)
+	require.Equal(t, "webhook", got.Payload.Name)
+	require.Equal(t, `<channel source="webhook">build failed</channel>`, got.Payload.ChannelMessage)
 }
 
 // TestNewClientWorkspace_SeedsSkillsCache verifies that the snapshot in
